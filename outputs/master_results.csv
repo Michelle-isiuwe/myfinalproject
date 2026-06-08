@@ -1,0 +1,2 @@
+balancing,model,accuracy,precision,recall,f1,roc_auc
+SMOTE+Tomek,MetaEnsemblePipeline,0.6614173228346457,0.7400416104363473,0.7065055325117245,0.7207253750815396,0.8920222439880657
