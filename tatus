@@ -1,0 +1,132 @@
+warning: in the working copy of 'app/pages/educator_students.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/pages/explainability.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/pages/prediction.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/pages/student_prediction.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app/pages/student_results.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'models/inference.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/app/pages/educator_students.py b/app/pages/educator_students.py[m
+[1mindex 60701db..a931762 100644[m
+[1m--- a/app/pages/educator_students.py[m
+[1m+++ b/app/pages/educator_students.py[m
+[36m@@ -23,8 +23,16 @@[m [mimport streamlit as st[m
+ from app.auth import current_user, require_login[m
+ from config import CGPA_BAND_DISPLAY, RISK_CLASSES, RISK_COLORS[m
+ from database import get_db[m
+[31m-from models.inference import ModelRegistry, predict_single[m
+[32m+[m[32mfrom models.inference import ABSTENTION_THRESHOLD, ModelRegistry, predict_single[m
+ from utils.explainability import lime_explain, shap_explain[m
+[32m+[m[32mfrom utils.friendly_labels import ([m
+[32m+[m[32m    friendly_confidence, friendly_probability,[m
+[32m+[m[32m    build_lime_narrative, build_shap_narrative,[m
+[32m+[m[32m)[m
+[32m+[m[32mfrom utils.recommendations import ([m
+[32m+[m[32m    feature_status_cards,[m
+[32m+[m[32m    detailed_recommendations_from_shap,[m
+[32m+[m[32m)[m
+ [m
+ # Lowest CGPA bands — students who may benefit from additional support.[m
+ # (Pass and Third Class.) Add "2.50 – 3.49" to include Second Class Lower.[m
+[36m@@ -292,11 +300,33 @@[m [mdef render():[m
+         # Prediction summary (latest is a DB row → 'predicted_risk' column)[m
+         band = latest["predicted_risk"][m
+         band_label = CGPA_BAND_DISPLAY.get(band, band)[m
+[31m-        with st.container(border=True):[m
+[31m-            mc1, mc2, mc3 = st.columns(3)[m
+[31m-            mc1.metric("Predicted Performance", band_label)[m
+[31m-            mc2.metric("Confidence", f"{latest['confidence']*100:.1f}%")[m
+[31m-            mc3.metric("Model", latest["model_used"])[m
+[32m+[m[32m        confidence = latest["confidence"][m
+[32m+[m[32m        conf_info = friendly_confidence(confidence)[m
+[32m+[m[41m        [m
+[32m+[m[32m        # Determine abstention (fallback safely if old record)[m
+[32m+[m[32m        abstained = confidence < ABSTENTION_THRESHOLD if pd.notna(confidence) else False[m
+[32m+[m
+[32m+[m[32m        if abstained:[m
+[32m+[m[32m            st.warning("⚠️ **The system could not make a confident prediction.**")[m
+[32m+[m[32m            with st.container(border=True):[m
+[32m+[m[32m                mc1, mc2, mc3 = st.columns(3)[m
+[32m+[m[32m                mc1.metric("Best Guess", band_label)[m
+[32m+[m[32m                mc2.markdown([m
+[32m+[m[32m                    f"**Confidence**\n\n"[m
+[32m+[m[32m                    f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"[m
+[32m+[m[32m                )[m
+[32m+[m[32m                mc2.caption("Below 70% threshold")[m
+[32m+[m[32m                mc3.metric("Model", latest["model_used"])[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            with st.container(border=True):[m
+[32m+[m[32m                mc1, mc2, mc3 = st.columns(3)[m
+[32m+[m[32m                mc1.metric("Predicted Performance", band_label)[m
+[32m+[m[32m                mc2.markdown([m
+[32m+[m[32m                    f"**Confidence**\n\n"[m
+[32m+[m[32m                    f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"[m
+[32m+[m[32m                )[m
+[32m+[m[32m                mc2.caption(conf_info['detail'])[m
+[32m+[m[32m                mc3.metric("Model", latest["model_used"])[m
+ [m
+         # Input breakdown[m
+         st.subheader("Input Features")[m
+[36m@@ -383,11 +413,50 @@[m [mdef render():[m
+                         margin=dict(l=10, r=10, t=50, b=10),[m
+                     )[m
+                     st.plotly_chart(fig, use_container_width=True)[m
+[32m+[m
+[32m+[m[32m                    # ---- Human-readable SHAP narrative ----[m
+[32m+[m[32m                    narratives = build_shap_narrative(df_shap, pred_label, max_items=6)[m
+[32m+[m[32m                    if narratives:[m
+[32m+[m[32m                        st.markdown("#### 📖 What this means")[m
+[32m+[m[32m                        st.caption([m
+[32m+[m[32m                            "Each factor below explains how it influenced "[m
+[32m+[m[32m                            "the prediction, in plain language."[m
+[32m+[m[32m                        )[m
+[32m+[m[32m                        for n in narratives:[m
+[32m+[m[32m                            st.markdown(n["sentence"])[m
+[32m+[m
+                     with st.expander("Full SHAP table"):[m
+                         st.dataframe([m
+                             df_shap.sort_values("abs", ascending=False).drop(columns="abs"),[m
+                             use_container_width=True,[m
+                         )[m
+[32m+[m
+[32m+[m[32m                    # ---- Areas to improve ----[m
+[32m+[m[32m                    recs = detailed_recommendations_from_shap([m
+[32m+[m[32m                        df_shap[["feature", "shap_value"]],[m
+[32m+[m[32m                        payload=payload,[m
+[32m+[m[32m                        max_items=4,[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                    if recs:[m
+[32m+[m[32m                        st.subheader("📌 Areas to Improve for this Student")[m
+[32m+[m[32m                        st.caption([m
+[32m+[m[32m                            "Based on the factors that lowered the prediction "[m
+[32m+[m[32m                            "— and that the student can act on."[m
+[32m+[m[32m                        )[m
+[32m+[m[32m                        for rec in recs:[m
+[32m+[m[32m                            sev = rec["severity"][m
+[32m+[m[32m                            with st.container(border=True):[m
+[32m+[m[32m                                st.markdown([m
+[32m+[m[32m                                    f"{sev['emoji']} **{rec['feature_name']}** — "[m
+[32m+[m[32m                                    f"*{sev['label']}*"[m
+[32m+[m[32m                                )[m
+[32m+[m[32m                                st.markdown(f"**Student answered:** {rec['current_value']}")[m
+[32m+[m[32m                                st.markdown(f"💡 {rec['advice']}")[m
+[32m+[m[32m                    else:[m
+[32m+[m[32m                        st.success([m
+[32m+[m[32m                            "✅ No specific improvement areas stood out — this "[m
+[32m+[m[32m                            "student's habits are contributing positively."[m
+[32m+[m[32m                        )[m
+                 except Exception as e:[m
+                     st.error(f"SHAP failed: {e}")[m
+ [m
+[36m@@ -410,6 +479,20 @@[m [mdef render():[m
+                         margin=dict(l=10, r=10, t=50, b=10),[m
+                     )[m
+                     st.plotly_chart(fig, use_container_width=True)[m
+[32m+[m
+[32m+[m[32m                    # ---- LIME narrative ----[m
+[32m+[m[32m                    narratives = build_lime_narrative([m
+[32m+[m[32m                        lime_res["pairs"], lime_label, max_items=8[m
+[32m+[m[32m                    )[m
+[32m+[m[32m                    if narratives:[m
+[32m+[m[32m                        st.markdown("#### 📖 What this means")[m
+[32m+[m[32m                        st.caption([m
+[32m+[m[32m                            "Each line below explains one factor and whether "[m
+[32m+[m[32m             

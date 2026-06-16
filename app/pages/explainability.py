@@ -20,6 +20,9 @@ from models.inference import ModelRegistry, predict_single
 from utils.explainability import (
     global_feature_importance, lime_explain, shap_explain,
 )
+from utils.friendly_labels import (
+    build_shap_narrative, build_lime_narrative,
+)
 from utils.preprocessing import load_and_prepare
 
 
@@ -111,6 +114,18 @@ def render():
                         margin=dict(l=10, r=10, t=50, b=10),
                     )
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # ---- SHAP narrative ----
+                    narratives = build_shap_narrative(df, pred_label, max_items=6)
+                    if narratives:
+                        st.markdown("#### 📖 What this means")
+                        st.caption(
+                            "Each factor below explains how it influenced "
+                            "the prediction, in plain language."
+                        )
+                        for n in narratives:
+                            st.markdown(n["sentence"])
+
                     with st.expander("Show full SHAP table"):
                         st.dataframe(df.sort_values("abs", ascending=False)
                                      .drop(columns="abs"), use_container_width=True)
@@ -142,6 +157,20 @@ def render():
                         margin=dict(l=10, r=10, t=50, b=10),
                     )
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # ---- LIME narrative ----
+                    narratives = build_lime_narrative(
+                        lime_res["pairs"], lime_label, max_items=8
+                    )
+                    if narratives:
+                        st.markdown("#### 📖 What this means")
+                        st.caption(
+                            "Each line below explains one factor and "
+                            "whether it helped or hurt this prediction."
+                        )
+                        for n in narratives:
+                            st.markdown(n["sentence"])
+
                     with st.expander("Show LIME pairs"):
                         st.dataframe(pd.DataFrame(lime_res["pairs"],
                                                   columns=["feature", "weight"]),

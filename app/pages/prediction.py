@@ -28,7 +28,8 @@ from config import (
     ORDINAL_ORDERINGS, RISK_CLASSES, RISK_COLORS,
 )
 from database import get_db
-from models.inference import ModelRegistry, predict_bulk, predict_single
+from models.inference import ABSTENTION_THRESHOLD, ModelRegistry, predict_bulk, predict_single
+from utils.friendly_labels import friendly_confidence, friendly_probability
 from utils.preprocessing import load_raw
 from utils.reports import build_prediction_report, predictions_to_csv_bytes
 
@@ -264,32 +265,78 @@ def _render_single_result(payload, result, model_name, user):
     band_label = CGPA_BAND_DISPLAY.get(band, band)
     confidence = result["confidence"]
     probs = result["probabilities"]
+    conf_info = friendly_confidence(confidence)
+    abstained = result.get("abstained", False)
 
+    # ==== ABSTENTION PANEL =================================================
+    if abstained:
+        with st.container(border=True):
+            st.caption("Best estimate")
+            st.markdown(f"## **{band_label}**")
+            st.markdown(
+                f"⚠️ **Low confidence — only {confidence*100:.0f}% sure "
+                f"({ABSTENTION_THRESHOLD*100:.0f}% needed for a reliable prediction)**"
+            )
+
+        fig = go.Figure()
+        for cls, p in probs.items():
+            fig.add_trace(go.Bar(
+                y=[CGPA_BAND_DISPLAY.get(cls, cls)], x=[p * 100],
+                orientation="h",
+                text=f"{p*100:.1f}%",
+                textposition="outside",
+                marker_color=RISK_COLORS.get(cls, "#94A3B8"),
+                name=cls,
+            ))
+        fig.update_layout(
+            xaxis=dict(range=[0, 100], title="Likelihood (%)"),
+            height=240, showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=10, r=100, t=10, b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        reasons = result.get("abstention_reasons", [])
+        if reasons:
+            with st.expander("Why am I unsure?", expanded=False):
+                for r in reasons:
+                    st.markdown(f"- **{r['title']}**: {r['detail']}")
+
+        st.info("Double-check your answers are accurate and up to date, then try again.")
+
+        # Download report
+        report = build_prediction_report(
+            payload, result, model_name=model_name,
+            educator=user.get("full_name") or user["username"],
+        )
+        st.download_button(
+            "⬇️ Download prediction report (.txt)",
+            data=report.encode("utf-8"),
+            file_name=f"prediction_report_{datetime.now():%Y%m%d_%H%M%S}.txt",
+            mime="text/plain",
+        )
+        return
+
+    # ==== NORMAL PREDICTION RESULT =========================================
     with st.container(border=True):
         cols = st.columns([1, 1, 1])
         with cols[0]:
             st.metric("Predicted band", band_label, delta=None)
         with cols[1]:
-            st.metric("Confidence", f"{confidence*100:.2f}%")
+            st.markdown(
+                f"**Confidence**\n\n"
+                f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"
+            )
+            st.caption(conf_info["detail"])
         with cols[2]:
             st.metric("Model", model_name)
 
-        # Probability gauges
-        fig = go.Figure()
-        for cls, p in probs.items():
-            fig.add_trace(go.Bar(
-                y=[CGPA_BAND_DISPLAY.get(cls, cls)], x=[p * 100], orientation="h",
-                text=f"{p*100:.1f}%", textposition="auto",
-                marker_color=RISK_COLORS.get(cls, "#94A3B8"), name=cls,
-            ))
-        fig.update_layout(
-            title="Class probabilities",
-            xaxis=dict(range=[0, 100], title="probability (%)"),
-            height=260, showlegend=False,
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=10, r=10, t=40, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        # Probability bars with friendly labels
+        _render_probability_bars(probs, conf_info)
+
+        # ---- Areas to Improve panel ----
+        _render_areas_to_improve(payload, result, model_name)
 
         st.info(
             f"➡️ Visit the **Explainability** page to see *why* this student was predicted as **{band_label}**."
@@ -306,3 +353,106 @@ def _render_single_result(payload, result, model_name, user):
             file_name=f"prediction_report_{datetime.now():%Y%m%d_%H%M%S}.txt",
             mime="text/plain",
         )
+
+
+def _render_probability_bars(probs, conf_info):
+    """Render horizontal probability bars with friendly labels alongside."""
+    fig = go.Figure()
+    for cls, p in probs.items():
+        prob_info = friendly_probability(p)
+        fig.add_trace(go.Bar(
+            y=[CGPA_BAND_DISPLAY.get(cls, cls)], x=[p * 100], orientation="h",
+            text=f"{p*100:.1f}% — {prob_info['text']}",
+            textposition="auto",
+            marker_color=RISK_COLORS.get(cls, "#94A3B8"), name=cls,
+        ))
+    fig.update_layout(
+        title="How likely is each performance band?",
+        xaxis=dict(range=[0, 100], title="Likelihood (%)"),
+        height=260, showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_areas_to_improve(payload, result, model_name):
+    """Show educators what specific areas a student should work on."""
+    from models.inference import ModelRegistry
+    from utils.explainability import shap_explain
+    from utils.recommendations import (
+        detailed_recommendations_from_shap,
+        feature_status_cards,
+    )
+    from utils.preprocessing import load_and_prepare
+
+    registry = ModelRegistry()
+    try:
+        model = registry.get_model(model_name)
+        res = predict_single(payload, model_name, registry)
+        X_row = res["X_transformed"][0]
+
+        @st.cache_data(show_spinner=False)
+        def _bg():
+            X, _, _ = load_and_prepare()
+            preproc = registry.get_preprocessor()
+            bg = preproc.transform(X.sample(min(80, len(X)), random_state=42))
+            return bg, list(preproc.get_feature_names_out())
+
+        background, feature_names = _bg()
+        le = registry.get_label_encoder()
+        class_names = list(le.classes_)
+        class_idx = class_names.index(res["predicted_band"])
+
+        shap_res = shap_explain(model, X_row, background,
+                                feature_names, class_idx, class_names)
+        import pandas as pd
+        shap_df = pd.DataFrame({
+            "feature": shap_res["feature_names"],
+            "shap_value": shap_res["shap_values"],
+        })
+
+        # ---- Feature Status Cards ----
+        cards = feature_status_cards(shap_df, payload, max_items=6)
+        if cards:
+            st.markdown("### 📊 Student Factor Overview")
+            st.caption("At-a-glance view of key factors affecting this prediction.")
+            card_cols = st.columns(3)
+            for i, card in enumerate(cards):
+                with card_cols[i % 3]:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"{card['emoji']} **{card['feature_name']}**\n\n"
+                            f"Status: {card['label']}\n\n"
+                            f"Current: *{card['current_value']}*"
+                        )
+
+        # ---- Detailed recommendations ----
+        recs = detailed_recommendations_from_shap(shap_df, payload, max_items=5)
+        if recs:
+            st.markdown("### 📌 Areas to Improve")
+            st.caption(
+                "These areas are negatively affecting this student's "
+                "predicted performance. Each includes what they're "
+                "currently doing and what could help."
+            )
+            for rec in recs:
+                sev = rec["severity"]
+                with st.container(border=True):
+                    st.markdown(
+                        f"{sev['emoji']} **{rec['feature_name']}** — "
+                        f"*{sev['label']}*"
+                    )
+                    st.markdown(
+                        f"**Currently:** {rec['current_value']}"
+                    )
+                    st.markdown(f"💡 {rec['advice']}")
+        else:
+            st.success(
+                "✅ No specific areas for improvement were flagged — "
+                "this student's habits are contributing positively."
+            )
+    except Exception:
+        # Silently skip the areas panel if SHAP fails; the main result
+        # is already shown and explainability page covers this in detail.
+        pass

@@ -26,7 +26,8 @@ from config import (
     CGPA_BAND_DISPLAY, NOMINAL_OPTIONS, ORDINAL_ORDERINGS, RISK_COLORS,
 )
 from database import get_db
-from models.inference import ModelRegistry, predict_single
+from models.inference import ABSTENTION_THRESHOLD, ModelRegistry, predict_single
+from utils.friendly_labels import friendly_confidence, friendly_probability
 from utils.preprocessing import load_raw
 
 # ---------------------------------------------------------------------------
@@ -41,7 +42,7 @@ ACADEMIC_FIELDS = [
     ),
     (
         "How often do you prepare for tests/exams in advance?",
-        "How far in advance do you start revising for tests?",
+        "How often do you prepare for tests in advance?",
         None,
     ),
     (
@@ -293,28 +294,78 @@ def render():
 
         # Immediate result display
         band       = result["predicted_band"]
-        band_label = CGPA_BAND_DISPLAY.get(band, band)   # e.g. "4.50 – 5.00 (First Class)"
+        band_label = CGPA_BAND_DISPLAY.get(band, band)
         confidence = result["confidence"]
         probs      = result["probabilities"]
+        conf_info  = friendly_confidence(confidence)
+        abstained  = result.get("abstained", False)
 
-        st.success("Prediction complete! Visit **My Results** for the full explanation.")
-        with st.container(border=True):
-            r1, r2 = st.columns(2)
-            r1.metric("Predicted Performance", band_label)
-            r2.metric("Confidence", f"{confidence*100:.1f}%")
+        # ---- ABSTENTION HANDLING ----
+        if abstained:
+            with st.container(border=True):
+                st.caption("Best estimate")
+                st.markdown(f"## **{band_label}**")
+                st.markdown(
+                    f"⚠️ **Low confidence — only {confidence*100:.0f}% sure "
+                    f"({ABSTENTION_THRESHOLD*100:.0f}% needed for a reliable prediction)**"
+                )
 
             fig = go.Figure()
             for cls, p in probs.items():
                 fig.add_trace(go.Bar(
-                    y=[CGPA_BAND_DISPLAY.get(cls, cls)], x=[p * 100], orientation="h",
-                    text=f"{p*100:.1f}%", textposition="auto",
-                    marker_color=RISK_COLORS.get(cls, "#94A3B8"), name=cls,
+                    y=[CGPA_BAND_DISPLAY.get(cls, cls)], x=[p * 100],
+                    orientation="h",
+                    text=f"{p*100:.1f}%",
+                    textposition="outside",
+                    marker_color=RISK_COLORS.get(cls, "#94A3B8"),
+                    name=cls,
                 ))
             fig.update_layout(
-                title="Class probabilities",
-                xaxis=dict(range=[0, 100], title="probability (%)"),
+                xaxis=dict(range=[0, 100], title="Likelihood (%)"),
                 height=240, showlegend=False,
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=10, r=10, t=40, b=10),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=10, r=80, t=10, b=10),
             )
             st.plotly_chart(fig, use_container_width=True)
+
+            reasons = result.get("abstention_reasons", [])
+            if reasons:
+                with st.expander("Why am I unsure?", expanded=False):
+                    for r in reasons:
+                        st.markdown(f"- **{r['title']}**: {r['detail']}")
+
+            st.info(
+                "Double-check your answers are accurate and up to date, then try again."
+            )
+        else:
+            # ---- NORMAL RESULT ----
+            st.success("Prediction complete! Visit **My Results** for the full explanation.")
+            with st.container(border=True):
+                r1, r2 = st.columns(2)
+                r1.metric("Predicted Performance", band_label)
+                r2.markdown(
+                    f"**Confidence**\n\n"
+                    f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"
+                )
+                r2.caption(conf_info["detail"])
+
+                fig = go.Figure()
+                for cls, p in probs.items():
+                    prob_info = friendly_probability(p)
+                    fig.add_trace(go.Bar(
+                        y=[CGPA_BAND_DISPLAY.get(cls, cls)], x=[p * 100],
+                        orientation="h",
+                        text=f"{p*100:.1f}% — {prob_info['text']}",
+                        textposition="auto",
+                        marker_color=RISK_COLORS.get(cls, "#94A3B8"), name=cls,
+                    ))
+                fig.update_layout(
+                    title="How likely is each performance band?",
+                    xaxis=dict(range=[0, 100], title="Likelihood (%)"),
+                    height=240, showlegend=False,
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=10, r=10, t=40, b=10),
+                )
+                st.plotly_chart(fig, use_container_width=True)

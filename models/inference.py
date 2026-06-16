@@ -14,7 +14,14 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from config import FEATURE_COLS, MODELS_DIR
+from config import FEATURE_COLS, MODELS_DIR, CGPA_BAND_DISPLAY
+
+# ---------------------------------------------------------------------------
+# Abstention threshold — if the top-class probability is below this value
+# the system abstains from making a definitive prediction and instead shows
+# an explanation of why it is uncertain.
+# ---------------------------------------------------------------------------
+ABSTENTION_THRESHOLD = 0.70
 
 
 def _slug(name: str) -> str:
@@ -99,9 +106,85 @@ def _ensure_dataframe(payload) -> pd.DataFrame:
     return df[FEATURE_COLS]
 
 
+# ---------------------------------------------------------------------------
+# Abstention helpers
+# ---------------------------------------------------------------------------
+def _compute_abstention_reasons(proba: np.ndarray, classes: list) -> list:
+    """Analyse a probability vector and return human-readable reasons for
+    uncertainty when the system cannot make a confident prediction.
+
+    Returns a list of dicts, each with 'title' and 'detail' keys.
+    """
+    reasons = []
+    sorted_proba = np.sort(proba)[::-1]
+    top1, top2 = sorted_proba[0], sorted_proba[1] if len(sorted_proba) > 1 else 0.0
+
+    # 1. Low top probability
+    reasons.append({
+        "title": "Low overall confidence",
+        "detail": (
+            f"The highest probability for any performance band is only "
+            f"{top1*100:.0f}%. The system requires at least "
+            f"{ABSTENTION_THRESHOLD*100:.0f}% confidence to make a "
+            f"definitive prediction."
+        ),
+    })
+
+    # 2. Close competition between top classes
+    gap = top1 - top2
+    if gap < 0.15:
+        top1_cls = classes[int(np.argmax(proba))]
+        top1_label = CGPA_BAND_DISPLAY.get(top1_cls, top1_cls)
+        sorted_idx = np.argsort(proba)[::-1]
+        top2_cls = classes[sorted_idx[1]]
+        top2_label = CGPA_BAND_DISPLAY.get(top2_cls, top2_cls)
+        reasons.append({
+            "title": "Close competition between bands",
+            "detail": (
+                f"The top two predicted bands are very close: "
+                f"**{top1_label}** ({top1*100:.0f}%) and "
+                f"**{top2_label}** ({top2*100:.0f}%). "
+                f"The system cannot reliably distinguish between them."
+            ),
+        })
+
+    # 3. Spread across many classes
+    above_10 = int(np.sum(proba >= 0.10))
+    if above_10 >= 3:
+        reasons.append({
+            "title": "Probability spread across multiple bands",
+            "detail": (
+                f"The student's data has meaningful probability "
+                f"(≥10%) spread across {above_10} different bands, "
+                f"indicating mixed signals in the input data."
+            ),
+        })
+
+    # 4. Entropy measure (simplified)
+    entropy = -np.sum(proba * np.log2(proba + 1e-12))
+    max_entropy = np.log2(len(classes))
+    if entropy > 0.7 * max_entropy:
+        reasons.append({
+            "title": "High uncertainty in the data",
+            "detail": (
+                "The student's responses produce an unusually uncertain "
+                "prediction. This may happen when the combination of study "
+                "habits, lifestyle factors, and demographic data does not "
+                "closely match common patterns in the training data."
+            ),
+        })
+
+    return reasons
+
+
 def predict_single(payload: Dict, model_name: str,
                    registry: ModelRegistry | None = None) -> Dict:
-    """Predict CGPA band + probabilities + confidence for a single record."""
+    """Predict CGPA band + probabilities + confidence for a single record.
+
+    When confidence falls below ABSTENTION_THRESHOLD (0.70), the result
+    includes ``abstained=True`` with a list of human-readable reasons
+    explaining the uncertainty.
+    """
     registry = registry or ModelRegistry()
     preproc = registry.get_preprocessor()
     le = registry.get_label_encoder()
@@ -114,13 +197,21 @@ def predict_single(payload: Dict, model_name: str,
     pred_idx = int(np.argmax(proba))
     pred_label = le.inverse_transform([pred_idx])[0]
     classes = list(le.classes_)
+    confidence = float(proba[pred_idx])
+
+    abstained = confidence < ABSTENTION_THRESHOLD
+    abstention_reasons = (
+        _compute_abstention_reasons(proba, classes) if abstained else []
+    )
 
     return {
         "predicted_band": pred_label,
-        "confidence": float(proba[pred_idx]),
+        "confidence": confidence,
         "probabilities": {classes[i]: float(proba[i]) for i in range(len(classes))},
         "X_transformed": X,             # used by SHAP / LIME
         "raw_input": df.iloc[0].to_dict(),
+        "abstained": abstained,
+        "abstention_reasons": abstention_reasons,
     }
 
 

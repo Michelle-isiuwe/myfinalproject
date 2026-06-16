@@ -23,8 +23,16 @@ import streamlit as st
 from app.auth import current_user, require_login
 from config import CGPA_BAND_DISPLAY, RISK_CLASSES, RISK_COLORS
 from database import get_db
-from models.inference import ModelRegistry, predict_single
+from models.inference import ABSTENTION_THRESHOLD, ModelRegistry, predict_single
 from utils.explainability import lime_explain, shap_explain
+from utils.friendly_labels import (
+    friendly_confidence, friendly_probability,
+    build_lime_narrative, build_shap_narrative,
+)
+from utils.recommendations import (
+    feature_status_cards,
+    detailed_recommendations_from_shap,
+)
 
 # Lowest CGPA bands — students who may benefit from additional support.
 # (Pass and Third Class.) Add "2.50 – 3.49" to include Second Class Lower.
@@ -292,11 +300,33 @@ def render():
         # Prediction summary (latest is a DB row → 'predicted_risk' column)
         band = latest["predicted_risk"]
         band_label = CGPA_BAND_DISPLAY.get(band, band)
-        with st.container(border=True):
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Predicted Performance", band_label)
-            mc2.metric("Confidence", f"{latest['confidence']*100:.1f}%")
-            mc3.metric("Model", latest["model_used"])
+        confidence = latest["confidence"]
+        conf_info = friendly_confidence(confidence)
+        
+        # Determine abstention (fallback safely if old record)
+        abstained = confidence < ABSTENTION_THRESHOLD if pd.notna(confidence) else False
+
+        if abstained:
+            st.warning("⚠️ **The system could not make a confident prediction.**")
+            with st.container(border=True):
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Best Guess", band_label)
+                mc2.markdown(
+                    f"**Confidence**\n\n"
+                    f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"
+                )
+                mc2.caption("Below 70% threshold")
+                mc3.metric("Model", latest["model_used"])
+        else:
+            with st.container(border=True):
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Predicted Performance", band_label)
+                mc2.markdown(
+                    f"**Confidence**\n\n"
+                    f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"
+                )
+                mc2.caption(conf_info['detail'])
+                mc3.metric("Model", latest["model_used"])
 
         # Input breakdown
         st.subheader("Input Features")
@@ -383,10 +413,49 @@ def render():
                         margin=dict(l=10, r=10, t=50, b=10),
                     )
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # ---- Human-readable SHAP narrative ----
+                    narratives = build_shap_narrative(df_shap, pred_label, max_items=6)
+                    if narratives:
+                        st.markdown("#### 📖 What this means")
+                        st.caption(
+                            "Each factor below explains how it influenced "
+                            "the prediction, in plain language."
+                        )
+                        for n in narratives:
+                            st.markdown(n["sentence"])
+
                     with st.expander("Full SHAP table"):
                         st.dataframe(
                             df_shap.sort_values("abs", ascending=False).drop(columns="abs"),
                             use_container_width=True,
+                        )
+
+                    # ---- Areas to improve ----
+                    recs = detailed_recommendations_from_shap(
+                        df_shap[["feature", "shap_value"]],
+                        payload=payload,
+                        max_items=4,
+                    )
+                    if recs:
+                        st.subheader("📌 Areas to Improve for this Student")
+                        st.caption(
+                            "Based on the factors that lowered the prediction "
+                            "— and that the student can act on."
+                        )
+                        for rec in recs:
+                            sev = rec["severity"]
+                            with st.container(border=True):
+                                st.markdown(
+                                    f"{sev['emoji']} **{rec['feature_name']}** — "
+                                    f"*{sev['label']}*"
+                                )
+                                st.markdown(f"**Student answered:** {rec['current_value']}")
+                                st.markdown(f"💡 {rec['advice']}")
+                    else:
+                        st.success(
+                            "✅ No specific improvement areas stood out — this "
+                            "student's habits are contributing positively."
                         )
                 except Exception as e:
                     st.error(f"SHAP failed: {e}")
@@ -410,6 +479,20 @@ def render():
                         margin=dict(l=10, r=10, t=50, b=10),
                     )
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # ---- LIME narrative ----
+                    narratives = build_lime_narrative(
+                        lime_res["pairs"], lime_label, max_items=8
+                    )
+                    if narratives:
+                        st.markdown("#### 📖 What this means")
+                        st.caption(
+                            "Each line below explains one factor and whether "
+                            "it helped or hurt this prediction."
+                        )
+                        for n in narratives:
+                            st.markdown(n["sentence"])
+
                     with st.expander("LIME pairs"):
                         st.dataframe(
                             pd.DataFrame(lime_res["pairs"], columns=["feature", "weight"]),

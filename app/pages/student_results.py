@@ -15,11 +15,18 @@ import plotly.express as px
 import streamlit as st
 
 from app.auth import current_user, require_login
-from config import CGPA_BAND_DISPLAY
+from config import CGPA_BAND_DISPLAY, RISK_COLORS
 from database import get_db
-from models.inference import ModelRegistry, predict_single
+from models.inference import ABSTENTION_THRESHOLD, ModelRegistry, predict_single
 from utils.explainability import lime_explain, shap_explain
-from utils.recommendations import recommendations_from_shap
+from utils.friendly_labels import (
+    friendly_confidence, friendly_probability,
+    build_lime_narrative, build_shap_narrative,
+)
+from utils.recommendations import (
+    recommendations_from_shap,
+    detailed_recommendations_from_shap,
+)
 
 
 def _load_latest_prediction(db, user_id: int) -> dict | None:
@@ -85,16 +92,43 @@ def render():
         st.caption(f"Based on your prediction from {last['timestamp']}.")
 
     # ---- result summary ---------------------------------------------------
+    conf_info = friendly_confidence(confidence)
+    abstained = result.get("abstained", False)
+
+    if abstained:
+        st.warning(
+            "⚠️ **The system was not confident enough to give a definitive "
+            "prediction for this submission.**"
+        )
+        with st.container(border=True):
+            st.markdown(
+                f"The system needs at least **{ABSTENTION_THRESHOLD*100:.0f}%** "
+                f"confidence. Your result was only **{confidence*100:.0f}%** certain."
+            )
+            st.markdown(f"**Best guess:** {band_label} — but treat this with caution.")
+
+            reasons = result.get("abstention_reasons", [])
+            if reasons:
+                st.markdown("#### Why is this uncertain?")
+                for r in reasons:
+                    st.markdown(f"- **{r['title']}**: {r['detail']}")
+
     with st.container(border=True):
         c1, c2 = st.columns(2)
         c1.metric("Predicted Performance", band_label)
-        c2.metric("Confidence", f"{confidence*100:.2f}%")
+        c2.markdown(
+            f"**Confidence**\n\n"
+            f"{conf_info['emoji']} **{conf_info['text']}** ({confidence*100:.0f}%)"
+        )
+        c2.caption(conf_info['detail'])
 
         dist = pd.DataFrame([{"Class": CGPA_BAND_DISPLAY.get(k, k),
-                              "Probability (%)": round(v * 100, 1)}
+                              "Probability (%)": round(v * 100, 1),
+                              "Meaning": friendly_probability(v)["text"]}
                               for k, v in probs.items()])
         fig = px.bar(dist, x="Probability (%)", y="Class", orientation="h",
-                     text="Probability (%)", title="Class probabilities")
+                     text=dist.apply(lambda r: f"{r['Probability (%)']}% — {r['Meaning']}", axis=1),
+                     title="How likely is each performance band?")
         fig.update_layout(
             height=240, showlegend=False,
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
@@ -128,8 +162,8 @@ def render():
 
     # ---- SHAP -------------------------------------------------------------
     if method in ("SHAP", "Both"):
-        st.subheader("🔍 SHAP Explanation")
-        st.caption("Shows which study habits helped or hurt your predicted performance.")
+        st.subheader("🔍 What drove this prediction?")
+        st.caption("Shows which of your study habits helped or hurt your predicted performance.")
         with st.spinner("Computing SHAP values…"):
             try:
                 shap_res = shap_explain(model, X_row, background,
@@ -151,40 +185,73 @@ def render():
                     margin=dict(l=10, r=10, t=50, b=10),
                 )
                 st.plotly_chart(fig, use_container_width=True)
-                with st.expander("Full SHAP table"):
+
+                # ---- Human-readable SHAP narrative ----
+                narratives = build_shap_narrative(df, band_label, max_items=6)
+                if narratives:
+                    st.markdown("#### 📖 What this means")
+                    st.caption(
+                        "Each factor below explains how one of your habits "
+                        "influenced the prediction, in plain language."
+                    )
+                    for n in narratives:
+                        st.markdown(n["sentence"])
+
+                with st.expander("Show full SHAP table"):
                     st.dataframe(
                         df.sort_values("abs", ascending=False).drop(columns="abs"),
                         use_container_width=True,
                     )
 
-                recs = recommendations_from_shap(
-                    df[["feature", "shap_value"]], max_items=4)
+                # ---- Areas to improve ----
+                recs = detailed_recommendations_from_shap(
+                    df[["feature", "shap_value"]],
+                    payload=last.get("payload"),
+                    max_items=4,
+                )
                 if recs:
-                    st.subheader("📌 Suggestions to improve")
-                    st.caption("Based on the factors above that lowered your "
-                               "predicted band — and that you can act on.")
-                    for r in recs:
-                        st.markdown(f"- {r}")
+                    st.subheader("📌 Areas to Improve")
+                    st.caption(
+                        "Based on the factors that lowered your prediction "
+                        "— and that you can act on."
+                    )
+                    for rec in recs:
+                        sev = rec["severity"]
+                        with st.container(border=True):
+                            st.markdown(
+                                f"{sev['emoji']} **{rec['feature_name']}** — "
+                                f"*{sev['label']}*"
+                            )
+                            st.markdown(f"**You answered:** {rec['current_value']}")
+                            st.markdown(f"💡 {rec['advice']}")
                 else:
-                    st.info("No specific improvement areas stood out — keep up "
-                            "your current habits.")
+                    st.success(
+                        "✅ No specific improvement areas stood out — keep up "
+                        "your current habits."
+                    )
             except Exception as e:
                 st.error(f"SHAP failed: {e}")
 
     # ---- LIME -------------------------------------------------------------
     if method in ("LIME", "Both"):
         st.subheader("🔍 LIME Explanation")
-        st.caption("An alternative local explanation showing feature weights for this prediction.")
+        st.caption(
+            "An alternative way of showing which factors drove this "
+            "prediction and whether each one helped or hurt."
+        )
         with st.spinner("Computing LIME explanation…"):
             try:
                 lime_res = lime_explain(model, X_row, background, feature_names,
                                         class_names, class_idx, num_features=12)
                 rows = pd.DataFrame(lime_res["pairs"], columns=["feature", "weight"])
                 rows = rows.iloc[::-1]
+                lime_label = CGPA_BAND_DISPLAY.get(
+                    lime_res["class_name"], lime_res["class_name"]
+                )
                 fig = px.bar(
                     rows, x="weight", y="feature", orientation="h",
                     color="weight", color_continuous_scale="RdBu_r",
-                    title=f"LIME contributions for class '{CGPA_BAND_DISPLAY.get(lime_res['class_name'], lime_res['class_name'])}'",
+                    title=f"LIME contributions for '{lime_label}'",
                 )
                 fig.update_layout(
                     height=480, plot_bgcolor="rgba(0,0,0,0)",
@@ -192,6 +259,20 @@ def render():
                     margin=dict(l=10, r=10, t=50, b=10),
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+                # ---- LIME narrative ----
+                narratives = build_lime_narrative(
+                    lime_res["pairs"], lime_label, max_items=8
+                )
+                if narratives:
+                    st.markdown("#### 📖 What this means")
+                    st.caption(
+                        "Each line below explains one factor and whether "
+                        "it helped or hurt your prediction."
+                    )
+                    for n in narratives:
+                        st.markdown(n["sentence"])
+
                 with st.expander("LIME feature weights"):
                     st.dataframe(
                         pd.DataFrame(lime_res["pairs"], columns=["feature", "weight"]),
